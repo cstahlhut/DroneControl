@@ -51,6 +51,7 @@ namespace IngameScript
 
         bool droneLaunchFinished = false;
         bool droneLaunching = false;
+        bool droneLaunched = true;
         bool droneDocking = false;
         bool droneDocked = false;
         bool droneIsFlyingToDockingWaypoint = false;
@@ -94,6 +95,9 @@ namespace IngameScript
 
             // Update all the blocks from the grid in the lists
             UpdateGridBlocks();
+
+            if (!IsCarrierGrid())
+                RenameGridBasedOnCarrierConnectorAndSuffixBlocks();
 
             _myBroadcastListener = IGC.RegisterBroadcastListener(_broadCastTag);
             _myBroadcastListener.SetMessageCallback(_broadCastTag);
@@ -158,6 +162,8 @@ namespace IngameScript
         {
             if (!droneLaunching && !droneDocking && !droneDocked)
                 UpdateAntennaWithOffensiveBlockCondition();
+            else if (droneDocked && !droneLaunched)
+                updateAntennaWithDocked = true;
 
             CheckConditionsAndUpdateAntenna();
         }
@@ -263,6 +269,7 @@ namespace IngameScript
             SetRemoteControlWaypointFromMessage();
             droneIsFlyingToDockingWaypoint = true;
             droneDocking = true;
+            droneLaunched = false;
             updateAntennaWithDocking = true;
         }
 
@@ -286,34 +293,6 @@ namespace IngameScript
             myRemoteControl.ApplyAction("AutoPilot_On");
             //lcdPanel.WriteText($"GPS:{Me.CubeGrid.CustomName}:{finalDestination.X}:{finalDestination.Y}:{finalDestination.Z}:#FF75C9F1", false);
             //Echo($"Flying to GPS coordinates: {finalDestination}");
-        }
-
-        bool TryParseEntityIdFromMessage(string message, out long entityId)
-        {
-            entityId = 0; // Default value in case parsing fails
-
-            // Extract the entity ID from the received message
-            string[] parts = message.Split(':');
-            if (parts.Length == 2)
-            {
-                if (long.TryParse(parts[1], out entityId))
-                {
-                    // Parsing successful
-                    return true;
-                }
-                else
-                {
-                    // Parsing failed
-                    Echo("Failed to parse entity ID");
-                }
-            }
-            else
-            {
-                // Unexpected message format
-                Echo("Unexpected message format");
-            }
-
-            return false;
         }
 
         void UpdateCustomData(bool writeOnly = false)
@@ -439,6 +418,7 @@ namespace IngameScript
 
             droneLaunching = false;
             droneLaunchFinished = true;
+            droneLaunched = true;
             //Runtime.UpdateFrequency = UpdateFrequency.None;
             //lcdPanel.WriteText("Launch Method Finished\n", true);
         }
@@ -453,6 +433,7 @@ namespace IngameScript
             
             droneDocking = false;
             droneDocked = true;
+            droneLaunched = false;
             updateAntennaWithDocked = true;
         }
 
@@ -822,83 +803,6 @@ namespace IngameScript
             }
         }
 
-        bool GridNameFormatCorrect()
-        {
-            // Get the current grid name
-            string gridName = Me.CubeGrid.CustomName;
-
-            // Check if the grid name has the format "Drone X" where X is a number
-            if (!System.Text.RegularExpressions.Regex.IsMatch(gridName, @"^Drone \d+$"))
-            {
-                Echo("\nWarning: Grid name must be in the format 'Drone X' where X is a number. Action not performed.\n");
-                return false;
-            }
-            else
-            {
-                return true;
-            }
-        }
-
-        void RenameBlocksToGridName()
-        {
-            // Get the current grid name
-            string gridName = Me.CubeGrid.CustomName;
-
-            // Get all blocks on the current grid
-            List<IMyTerminalBlock> blocks = new List<IMyTerminalBlock>();
-            GridTerminalSystem.GetBlocks(blocks);
-
-            int updatedBlockCount = 0;
-
-            // Iterate through each block and update its name
-            foreach (var block in blocks)
-            {
-                if (block.CubeGrid == Me.CubeGrid)
-                {
-                    // Check if the block's name contains " - Drone"
-                    if (block.CustomName.Contains(" - Drone"))
-                    {
-                        // Extract the existing " - Drone X" part from the block's name
-                        int startIndex = block.CustomName.LastIndexOf(" - Drone");
-                        int endIndex = block.CustomName.Length;
-
-                        string existingDronePart = block.CustomName.Substring(startIndex, endIndex - startIndex);
-
-                        // Check if the grid name is already appended
-                        if (!existingDronePart.Equals(" - " + gridName))
-                        {
-                            // Replace the existing " - Drone X" part with the current grid name
-                            string newName = block.CustomName.Replace(existingDronePart, " - " + gridName);
-
-                            // Update the block's name
-                            block.CustomName = newName;
-                            updatedBlockCount++;
-                        }
-                    }
-                    // Check if the block's name doesn't contain " - Drone"
-                    else
-                    {
-                        // If not, append the grid name
-                        string newName = block.CustomName + " - " + gridName;
-
-                        // Update the block's name
-                        block.CustomName = newName;
-                        updatedBlockCount++;
-                    }
-                }
-            }
-
-            // Output the result
-            if (updatedBlockCount > 0)
-            {
-                //Echo($"Updated {updatedBlockCount} block(s) with Grid Name {gridName}.");
-            }
-            else
-            {
-                //Echo($"All blocks already have the correct Grid Name \"{gridName}\" format. No changes required.");
-            }
-        }
-
         IMyShipConnector SaveCarrierConnector()
         {
             if (droneConnector.Status == MyShipConnectorStatus.Connected || droneConnector.Status == MyShipConnectorStatus.Connectable)
@@ -1042,12 +946,62 @@ namespace IngameScript
             }
         }
 
-
         private bool ShouldRunMain(string argument, UpdateType updateType)
         {
             return (updateType & (UpdateType.Trigger | UpdateType.Terminal)) > 0 ||
                    (updateType & (UpdateType.Mod)) > 0 ||
                    (updateType & (UpdateType.Script)) > 0;
+        }
+
+        void RenameGridBasedOnCarrierConnectorAndSuffixBlocks()
+        {
+            IMyShipConnector carrierConnector = SaveCarrierConnector();
+
+            if (carrierConnector != null)
+            {
+                string carrierConnectorName = carrierConnector.CustomName;
+                string gridName = GetNumberFromString(carrierConnectorName);
+
+                if (!string.IsNullOrEmpty(gridName))
+                {
+                    RenameGrid(gridName);
+                }
+            }
+        }
+
+        string GetNumberFromString(string inputString)
+        {
+            // Assuming the input string contains a number
+            string[] words = inputString.Split(' ');
+
+            foreach (var word in words)
+            {
+                int number; // Declare the out variable before using it
+                if (int.TryParse(word, out number))
+                {
+                    Echo($"Drone {number}");
+                    return $"Drone {number}";
+                }
+            }
+
+            Echo($"Unable to parse number from input string: {inputString}");
+            return null; // Unable to parse number
+        }
+
+        void RenameGrid(string newGridName)
+        {
+            IMyCubeGrid currentGrid = droneConnector.CubeGrid;
+
+            if (currentGrid != null)
+            {
+                currentGrid.CustomName = newGridName;
+                Echo($"Grid renamed to {newGridName}");
+                
+            }
+            else
+            {
+                lcdPanel.WriteText($"Unable to rename grid. Current grid is null.", true);
+            }
         }
     }
 }
