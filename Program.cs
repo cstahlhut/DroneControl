@@ -1,22 +1,12 @@
-﻿using Sandbox.Game.EntityComponents;
-using Sandbox.ModAPI.Ingame;
+﻿using Sandbox.ModAPI.Ingame;
 using Sandbox.ModAPI.Interfaces;
-using SpaceEngineers.Game.ModAPI.Ingame;
-using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Linq;
-using System.Text;
-using VRage;
-using VRage.Collections;
-using VRage.Game;
-using VRage.Game.Components;
-using VRage.Game.GUI.TextPanel;
+using System.Text.RegularExpressions;
 using VRage.Game.ModAPI.Ingame;
 using VRage.Game.ModAPI.Ingame.Utilities;
-using VRage.Game.ObjectBuilders.Definitions;
 using VRageMath;
+
 
 namespace IngameScript
 {
@@ -33,7 +23,7 @@ namespace IngameScript
         IMyBroadcastListener _myBroadcastListener;
         IMyOffensiveCombatBlock droneOffensiveBlock = null;
         IMyShipController droneShipController = null;
-        IMyShipConnector carrier_connector = null;
+        IMyShipConnector carrierConnector = null;
         IMyShipConnector droneConnector = null;
         IMyProgrammableBlock droneControlProgrammableBlock = null;
         IMyProgrammableBlock spugProgrammableBlock = null;
@@ -42,9 +32,11 @@ namespace IngameScript
         IMyTextPanel lcdPanel;
 
         Vector3D Start = new Vector3D(0, 0, 0);
-        Vector3D dockWaypoint = new Vector3D(0, 0, 0);
+        Vector3D currentDockingWaypoint = new Vector3D(0, 0, 0);
         Vector3D carrierForwardDir = new Vector3D(0, 0, 0);
         Vector3D carrierCenterPosition = new Vector3D(0, 0, 0);
+        Vector3D iGCCarrierConnectorPosition = new Vector3D(0, 0, 0);
+        MatrixD iGCCarrierConnectorWorldmatrix = new MatrixD();
 
         MyIni _ini = new MyIni();
         DebugAPI Debug;
@@ -52,28 +44,33 @@ namespace IngameScript
         bool droneLaunchFinished = false;
         bool droneLaunching = false;
         bool droneLaunched = true;
-        bool droneDocking = false;
+        bool droneIsDocking = false;
         bool droneDocked = false;
-        bool droneIsFlyingToDockingWaypoint = false;
-        bool droneIsForwardOfCenter = false;
+        bool droneIsFlyingToRemoteControlDockingWaypoint = false;
+        bool droneIsFlyingToRemoteControlFollowWaypoint = false;
+        ThrustDirection launchThrustDirection;
         bool updateAntennaWithLaunching = false;
         bool updateAntennaWithDocking = false;
         bool updateAntennaWithScanning = false;
         bool updateAntennaWithAttacking = false;
         bool updateAntennaWithDocked = false;
         bool droneDisableAntennaOnDocking = false;
+        bool autoReturnToCarrierIfDistanceTooFar = true;
+
+        long carrier_connector_entityId = 0;
 
         float droneUpwardOverrideThrust = 150000.0f;
         float droneThrustValue = 100.0f;
         float droneLaunchDistance = 150.0f;
         float droneThrustMultiplier = 10000;
         float dockingConnectorWaypointOffset = -70.0f;
-        float remoteControlDockingSpeedLimit = 100.0f;
+        float distanceToCheckForAutoCarrierReturn = 10000.0f;
 
         string _thrust = "100";
         string _launchDistance = "100";
         string _disableAntennaOnDock = "true";
         string _broadCastTag = "DRONE_CONTROL";
+        string iGCCarrierConnectorCustomName = "";
 
         const string INI_SECTION_GENERAL = "Drone Control";
         const string INI_GENERAL_THRUST = "Thrust";
@@ -86,31 +83,57 @@ namespace IngameScript
 
         public Program()
         {
-            Runtime.UpdateFrequency = UpdateFrequency.Update1 | UpdateFrequency.Update10;
+            Runtime.UpdateFrequency = UpdateFrequency.Update1 | UpdateFrequency.Update10 | UpdateFrequency.Update100;
 
             Debug = new DebugAPI(this);
 
-            if (!IsCarrierGrid())
-                UpdateCustomData();
+            _myBroadcastListener = IGC.RegisterBroadcastListener(_broadCastTag);
+            _myBroadcastListener.SetMessageCallback(_broadCastTag);
 
             // Update all the blocks from the grid in the lists
             UpdateGridBlocks();
 
             if (!IsCarrierGrid())
+            {
+                UpdateCustomData();
                 RenameGridBasedOnCarrierConnectorAndSuffixBlocks();
+            }
+            else
+            {
+                UpdateBlocksOnGrid(Me.CubeGrid.CustomName);
+            }
 
-            _myBroadcastListener = IGC.RegisterBroadcastListener(_broadCastTag);
-            _myBroadcastListener.SetMessageCallback(_broadCastTag);
+            if (IsCarrierGrid())
+                return;
+
+            // Retreive storage data
+            string[] storedData = Storage.Split(';');
+            if (storedData.Length >= 1)
+            {
+                long.TryParse(storedData[0], out carrier_connector_entityId);
+                //if (lcdPanel != null)
+                //    lcdPanel.WriteText($"Carrier Connector ID:\n{carrier_connector_entityId}\n", true);
+            }
+
+            UpdateDroneCarrierConnectorData();
+
+        }
+
+        public void UpdateDroneCarrierConnectorData()
+        {
+            IGC.SendBroadcastMessage(_broadCastTag, "Retrieve Dock: " + carrier_connector_entityId);
+            //lcdPanel?.WriteText($"Drone Sent Message: Retrieve Dock: {carrier_connector_entityId}\n", true);
         }
 
         public void Save()
         {
-            // Called when the program needs to save its state. Use
-            // this method to save your state to the Storage field
-            // or some other means. 
-            // 
-            // This method is optional and can be removed if not
-            // needed.
+            if (carrierConnector != null)
+            {
+                // Combine the state variables into a string separated by the ';' character
+                Storage = string.Join(";",
+                    carrierConnector.EntityId.ToString()
+                );
+            }
         }
 
         public void Main(string argument, UpdateType updateType)
@@ -144,28 +167,78 @@ namespace IngameScript
             {
                 ExecuteUpdate10Loops();
             }
+
+            if ((updateType & UpdateType.Update100) != 0)
+            {
+                ExecuteUpdate100Loops();
+            }
         }
 
         private void ExecuteUpdate1Loops()
         {
+            if (IsCarrierGrid())
+                return;
+
             if (droneLaunching)
                 CheckIfDroneHasFinishedLaunch();
 
-            if (droneIsFlyingToDockingWaypoint)
+            if (droneIsFlyingToRemoteControlDockingWaypoint)
             {
                 CheckIfDroneHasArrivedAtDockingWaypoint();
-                Debug.DrawLine(myRemoteControl.GetPosition(), dockWaypoint, Color.Yellow, 0.1f, 0.1f, true);
+                Debug.DrawLine(myRemoteControl.GetPosition(), currentDockingWaypoint, Color.Yellow, 0.1f, 0.1f, true);
             }
+
+
         }
 
         private void ExecuteUpdate10Loops()
         {
-            if (!droneLaunching && !droneDocking && !droneDocked)
+            if (IsCarrierGrid())
+                return;
+
+            if (!droneLaunching && !droneIsDocking && !droneDocked)
                 UpdateAntennaWithOffensiveBlockCondition();
             else if (droneDocked && !droneLaunched)
                 updateAntennaWithDocked = true;
 
             CheckConditionsAndUpdateAntenna();
+
+            if (droneIsFlyingToRemoteControlDockingWaypoint && !droneDocked && !droneLaunching)
+            {
+                UpdateDroneCarrierConnectorData();
+                var dockingWaypointOffset = new Vector3D(0, 0, dockingConnectorWaypointOffset);
+                var newDockingWaypoint = Vector3D.Transform(dockingWaypointOffset, iGCCarrierConnectorWorldmatrix);
+                var distanceBetweenDockingWaypointAndNewDockingWaypoint = Vector3D.Distance(currentDockingWaypoint, newDockingWaypoint);
+
+                if (distanceBetweenDockingWaypointAndNewDockingWaypoint > 10.0f)
+                {
+                    SetRemoteControlDockingWaypoint();
+                }
+            }
+
+            if (droneIsFlyingToRemoteControlFollowWaypoint)
+            {
+                UpdateDroneCarrierConnectorData();
+                var dockingWaypointOffset = new Vector3D(0, 0, dockingConnectorWaypointOffset);
+                var newDockingWaypoint = Vector3D.Transform(dockingWaypointOffset, iGCCarrierConnectorWorldmatrix);
+                var distanceBetweenDockingWaypointAndNewDockingWaypoint = Vector3D.Distance(currentDockingWaypoint, newDockingWaypoint);
+
+                if (distanceBetweenDockingWaypointAndNewDockingWaypoint > 10.0f)
+                {
+                    SetRemoteControlDockingWaypoint();
+                }
+            }
+
+            if (droneLaunched && !droneIsDocking && autoReturnToCarrierIfDistanceTooFar)
+            {
+                UpdateDroneCarrierConnectorData();
+                CheckDistanceFromCarrier();
+            }
+        }
+
+        private void ExecuteUpdate100Loops()
+        {
+
         }
 
         private void HandleTerminalCommands(string argument)
@@ -185,15 +258,18 @@ namespace IngameScript
                     Echo("Sending IGC - Launch Carrier Drones");
                     IGC.SendBroadcastMessage(_broadCastTag, "carrier_launch");
                 }
+
+                if (argument == "follow")
+                {
+                    IGC.SendBroadcastMessage(_broadCastTag, "follow");
+                    Echo("Sending follow request");
+                }
             }
             else
             {
                 if (argument == "dock")
                 {
-                    if (carrier_connector != null)
-                        Dock();
-                    else
-                        Echo("No Carrier Connector set!");
+                    AttemptDock();
                 }
 
                 if (argument == "drone_launch")
@@ -212,33 +288,119 @@ namespace IngameScript
 
         private void HandleIGCCommunication(string argument)
         {
-            if (IsCarrierGrid())
+            if (IsCarrierGrid()) // Handle Carrier Communication
             {
-                // Handle Carrier Communication
+                if (argument.Contains("Retrieve Dock"))
+                {
+                    //lcdPanel.WriteText($"Received Message: {argument}\n", true);
+                    string entityId = new string(argument.Where(char.IsDigit).ToArray());
+                    long connector_entityid_to_find = 0;
+                    long.TryParse(entityId, out connector_entityid_to_find);
+                    //lcdPanel.WriteText($"Carrier Connector ID to find: {connector_entityid_to_find}\n", true);
+
+                    foreach (var connector in connectors)
+                    {
+                        if (connector.EntityId == connector_entityid_to_find && connector.CubeGrid == Me.CubeGrid)
+                        {
+                            //lcdPanel.WriteText($"Carrier Found Connector: {connector.CustomName}\n", true);
+                            IGC.SendBroadcastMessage(_broadCastTag, $"Connector Information:" +
+                                $" {connector.EntityId}" +
+                                $" {connector.CustomName}" +
+                                $" {connector.GetPosition()}" +
+                                $" {connector.WorldMatrix}" +
+                                $"");
+                            //lcdPanel.WriteText($"Carrier Sent Message: Connector Information:" +
+                            //    $" {connector.EntityId}" +
+                            //    $" {connector.GetPosition()}" +
+                            //    $" {connector.WorldMatrix}" +
+                            //    $"\n", true);
+                            break;
+                        }
+                    }
+                }
             }
-            else
+            else // Handle Drone Communication
             {
-                if (carrier_connector != null && droneConnector != null && droneConnector.Status != MyShipConnectorStatus.Connected)
+                if (argument.Contains($"{carrier_connector_entityId}"))
+                {
+                    //lcdPanel.WriteText($"Drone Received Message: {argument}\n", true);
+
+                    // Extract X, Y, and Z components from the message
+                    double x = ExtractGPSComponent("X", argument);
+                    double y = ExtractGPSComponent("Y", argument);
+                    double z = ExtractGPSComponent("Z", argument);
+
+                    Vector3D.TryParse(string.Format("{0} {1} {2}", x, y, z), out iGCCarrierConnectorPosition);
+                    iGCCarrierConnectorCustomName = ExtractConnectorCustomName(argument);
+                    //lcdPanel.WriteText($"Drone Carrier Connector Custom Name: {carrierConnectorCustomName}\n", true);
+                    iGCCarrierConnectorWorldmatrix = ParseMatrixFromString(argument);
+                    //lcdPanel.WriteText($"Drone Carrier Connector World Matrix: {carrierConnectorWorldMatrix}\n", true);
+                }
+
+                if (droneConnector != null && droneConnector.Status != MyShipConnectorStatus.Connected)
                 {
                     if (argument == "recall")
                     {
-                        Dock();
+                        AttemptDock();
                     }
+
+                    if (argument == "follow")
+                    {
+                        FollowCarrier();
+                    }
+                }
+
+                if (argument == "attack_forward")
+                {
+
                 }
 
                 if (argument == "carrier_launch")
                 {
                     Echo("Drone: Received IGC Carrier Launch command");
-                    LaunchDrone();
+                    if (droneConnector.Status == MyShipConnectorStatus.Connected || droneConnector.Status == MyShipConnectorStatus.Connectable)
+                        LaunchDrone();
+                }
+            }
+        }
+
+        static double ExtractGPSComponent(string componentName, string message)
+        {
+            string pattern = $"{componentName}:([^\\s]+)";
+            var match = System.Text.RegularExpressions.Regex.Match(message, pattern);
+
+            if (match.Success)
+            {
+                double componentValue;
+                if (double.TryParse(match.Groups[1].Value, out componentValue))
+                {
+                    return componentValue;
+                }
+            }
+
+            // Handle extraction failure
+            return 0.0;
+        }
+
+        private void CheckDistanceFromCarrier()
+        {
+            if (iGCCarrierConnectorPosition != Vector3D.Zero)
+            {
+                lcdPanel.WriteText("Dock triggered by Carrier Connector", true);
+                var droneDistanceFromCarrier = Vector3D.Distance(iGCCarrierConnectorPosition, Me.GetPosition());
+                if (droneDistanceFromCarrier > distanceToCheckForAutoCarrierReturn)
+                {
+                    lcdPanel.WriteText($"Dock triggered by IGC Connector: {droneDistanceFromCarrier}", true);
+                    AttemptDock();
                 }
             }
         }
 
         void CheckIfDroneHasFinishedLaunch()
         {
-            if (Vector3D.Distance(Start, Me.GetPosition()) >= droneLaunchDistance && droneLaunching && !droneLaunchFinished && !droneIsFlyingToDockingWaypoint)
+            if (Vector3D.Distance(Start, Me.GetPosition()) >= droneLaunchDistance && droneLaunching && !droneLaunchFinished && !droneIsFlyingToRemoteControlDockingWaypoint)
             {
-                lcdPanel.WriteText("Launch Finished\n", true);
+                //lcdPanel?.WriteText("Launch Finished\n", true);
                 FinishLaunch();
             }
             else
@@ -249,49 +411,51 @@ namespace IngameScript
                 //     if (droneIsForwardOfCenter)
                 //     {
                 //         double distanceToLaunchStop = Vector3D.Distance(Start, Me.GetPosition());
-                //         lcdPanel.WriteText("", false);
-                //         lcdPanel.WriteText($"Launching Forward\nLaunch Distance:\n {distanceToLaunchStop:F2}\n", false);
+                //         lcdPanel?.WriteText("", false);
+                //         lcdPanel?.WriteText($"Launching Forward\nLaunch Distance:\n {distanceToLaunchStop:F2}\n", false);
                 //     }
                 //     else
                 //     {
                 //         double distanceToLaunchStop = Vector3D.Distance(Start, Me.GetPosition());
-                //         lcdPanel.WriteText("", false);
-                //         lcdPanel.WriteText($"Launching Backward\nLaunch Distance:\n {distanceToLaunchStop:F2}\n", false);
+                //         lcdPanel?.WriteText("", false);
+                //         lcdPanel?.WriteText($"Launching Backward\nLaunch Distance:\n {distanceToLaunchStop:F2}\n", false);
                 //     }
                 // }
             }
         }
 
-        void Dock()
+        void AttemptDock()
         {
             ToggleThrusterOverride(false);
             DisableAIBehaviours();
-            SetRemoteControlWaypointFromMessage();
-            droneIsFlyingToDockingWaypoint = true;
-            droneDocking = true;
+            SetRemoteControlDockingWaypoint();
+            droneIsFlyingToRemoteControlDockingWaypoint = true;
+            droneIsDocking = true;
             droneLaunched = false;
             updateAntennaWithDocking = true;
         }
 
-        void SetRemoteControlWaypointFromMessage()
+        void FollowCarrier()
         {
-            if (carrier_connector == null)
-            {
-                Echo("Carrier connector not found");
-                return;
-            }
+            ToggleThrusterOverride(false);
+            DisableAIBehaviours();
+            SetRemoteControlDockingWaypoint();
+            droneIsFlyingToRemoteControlFollowWaypoint = true;
+        }
 
-            var offsetLocal = new Vector3D(0, 0, dockingConnectorWaypointOffset);
-            var finalDestination = Vector3D.Transform(offsetLocal, carrier_connector.WorldMatrix);
-            dockWaypoint = finalDestination;
+        void SetRemoteControlDockingWaypoint()
+        {
+            UpdateDroneCarrierConnectorData();
+            var dockingWaypointOffset = new Vector3D(0, 0, dockingConnectorWaypointOffset);
+            currentDockingWaypoint = Vector3D.Transform(dockingWaypointOffset, iGCCarrierConnectorWorldmatrix);
 
             myRemoteControl.ClearWaypoints();
-            myRemoteControl.AddWaypoint(finalDestination, "Carrier Connector Position");
+            myRemoteControl.AddWaypoint(currentDockingWaypoint, "Carrier Connector Position");
             myRemoteControl.FlightMode = FlightMode.OneWay;
-            myRemoteControl.SpeedLimit = remoteControlDockingSpeedLimit;
+            //myRemoteControl.SpeedLimit = remoteControlDockingSpeedLimit;
             myRemoteControl.ApplyAction("CollisionAvoidance_On");
             myRemoteControl.ApplyAction("AutoPilot_On");
-            //lcdPanel.WriteText($"GPS:{Me.CubeGrid.CustomName}:{finalDestination.X}:{finalDestination.Y}:{finalDestination.Z}:#FF75C9F1", false);
+            //lcdPanel?.WriteText($"GPS:{Me.CubeGrid.CustomName}:{finalDestination.X}:{finalDestination.Y}:{finalDestination.Z}:#FF75C9F1", false);
             //Echo($"Flying to GPS coordinates: {finalDestination}");
         }
 
@@ -323,30 +487,32 @@ namespace IngameScript
 
         void LaunchDrone()
         {
-            //lcdPanel.WriteText("Launch Method Started\n", true);
+            //lcdPanel?.WriteText("Launch Method Started\n", true);
             droneLaunching = true;
             droneLaunchFinished = false;
-            droneDocking = false;
+            droneIsDocking = false;
             droneDocked = false;
             Start = Me.GetPosition();
             updateAntennaWithLaunching = true;
 
             SaveCarrierConnector();
+            RenameGridBasedOnCarrierConnectorAndSuffixBlocks();
             ToggleHydrogenThrusters(true);
             ToggleHydrogenTanks(true);
             ToggleHydrogenTankStockpile(false);
             ToggleAntennas(true);
 
+            // Might need a tick 10 delay for hydrogen to come online for all of the below?
             if (spugProgrammableBlock != null)
             {
-                if (carrier_connector != null)
-                    spugProgrammableBlock.TryRun(carrier_connector.CustomName); //Updating SPUG with Connector name
+                if (carrierConnector != null)
+                    spugProgrammableBlock.TryRun(carrierConnector.CustomName); //Updating SPUG with Connector name
                 else
                     Echo("No Carrier Connector set!");
             }
             else
             {
-                lcdPanel.WriteText("SPUG PB not found\n", true);
+                lcdPanel?.WriteText("SPUG PB not found\n", true);
             }
 
             // Retrieve custom data from the programming block
@@ -378,28 +544,21 @@ namespace IngameScript
                 }
             }
 
-            carrierCenterPosition = carrier_connector.CubeGrid.WorldAABB.Center;
+            carrierCenterPosition = carrierConnector.CubeGrid.WorldAABB.Center;
             carrierForwardDir = new Vector3D(0, 0, 0);
             List<IMyShipController> shipController = new List<IMyShipController>();
             GridTerminalSystem.GetBlocksOfType(shipController);
             foreach (var controller in shipController)
             {
-                if (controller.CubeGrid == carrier_connector.CubeGrid)
+                if (controller.CubeGrid == carrierConnector.CubeGrid)
                 {
                     //Echo($"Found Carrier Controller: {controller.CustomName}");
                     carrierForwardDir = controller.WorldMatrix.Forward;
                 }
             }
-            droneIsForwardOfCenter = IsDroneForwardOfCarrierCenter(carrier_connector.GetPosition(), carrierCenterPosition, carrierForwardDir);
+            launchThrustDirection = DetermineDroneLaunchDirection(carrierConnector.GetPosition(), carrierCenterPosition, carrierForwardDir);
 
-            if (droneIsForwardOfCenter)
-            {
-                ToggleThrusterOverride(true, "forward", (droneThrustValue * droneThrustMultiplier));
-            }
-            else
-            {
-                ToggleThrusterOverride(true, "backward", (droneThrustValue * droneThrustMultiplier));
-            }
+            ToggleThrusterOverride(true, launchThrustDirection, (droneThrustValue * droneThrustMultiplier));
 
             ToggleBasicTaskBehaviour(false);
             ToggleOffensiveBlockkBehaviour(false);
@@ -420,7 +579,7 @@ namespace IngameScript
             droneLaunchFinished = true;
             droneLaunched = true;
             //Runtime.UpdateFrequency = UpdateFrequency.None;
-            //lcdPanel.WriteText("Launch Method Finished\n", true);
+            //lcdPanel?.WriteText("Launch Method Finished\n", true);
         }
 
         void Docked()
@@ -430,8 +589,8 @@ namespace IngameScript
             ToggleHydrogenTankStockpile(true);
             if (droneDisableAntennaOnDocking)
                 ToggleAntennas(false);
-            
-            droneDocking = false;
+
+            droneIsDocking = false;
             droneDocked = true;
             droneLaunched = false;
             updateAntennaWithDocked = true;
@@ -446,8 +605,9 @@ namespace IngameScript
             ToggleHydrogenThrusters(true);
             ToggleHydrogenTanks(true);
             ToggleHydrogenTankStockpile(false);
+            ToggleAntennas(true);
 
-            lcdPanel.WriteText("Controlling\n", true);
+            //lcdPanel?.WriteText("Controlling\n", true);
             //Echo("Controlling");
         }
 
@@ -478,7 +638,29 @@ namespace IngameScript
             FindAndStoreDroneOffensiveBlock();
         }
 
-        void ToggleThrusterOverride(bool enable, string direction = "", float thrustValue = 0.0f)
+        ThrustDirection DetermineDroneLaunchDirection(Vector3D dockingPos, Vector3D shipCenterPos, Vector3D shipForwardDir)
+        {
+            shipForwardDir.Normalize();  // Modifies shipForwardDir in place
+
+            //lcdPanel?.WriteText($"DockingPos:\n {dockingPos}\n", false);
+            //lcdPanel?.WriteText($"ShipCenterPos:\n {shipCenterPos}\n", false);
+            Vector3D dockingDir = dockingPos - shipCenterPos;
+            double dotProduct = Vector3D.Dot(dockingDir, shipForwardDir);
+            //lcdPanel?.WriteText($"Dot Product:\n {dotProduct}\n", false);
+
+            if (dotProduct > 20.0)
+                return ThrustDirection.HardForward;
+            else if (dotProduct >= 10.0 && dotProduct <= 20.0)
+                return ThrustDirection.SlightlyForward;
+            else if (dotProduct > -10.0 && dotProduct < 10.0)
+                return ThrustDirection.Up;
+            else if (dotProduct >= -20.0 && dotProduct <= -10.0)
+                return ThrustDirection.SlightlyBackward;
+            else
+                return ThrustDirection.HardBackward;
+        }
+
+        void ToggleThrusterOverride(bool enable, ThrustDirection direction = ThrustDirection.None, float thrustValue = 0.0f)
         {
             var forward = droneShipController.Orientation.TransformDirection(Base6Directions.Direction.Backward);
             var backward = droneShipController.Orientation.TransformDirection(Base6Directions.Direction.Forward);
@@ -489,6 +671,7 @@ namespace IngameScript
 
             List<IMyThrust> droneThrusters = new List<IMyThrust>();
             GridTerminalSystem.GetBlocksOfType(droneThrusters);
+            //lcdPanel?.WriteText($"Thrust Direction:\n {direction}\n", true);
 
             foreach (IMyThrust thruster in droneThrusters)
             {
@@ -497,12 +680,26 @@ namespace IngameScript
                     MyBlockOrientation thrusterDirection = thruster.Orientation;
                     if (enable)
                     {
-                        if (direction == "forward" && thrusterDirection.Forward == forward)
+                        if (direction == ThrustDirection.HardForward && thrusterDirection.Forward == forward)
+                        {
                             thruster.SetValue("Override", thrustValue);
-                        else if (direction == "backward" && thrusterDirection.Forward == backward)
+                        }
+                        else if (direction == ThrustDirection.SlightlyForward && thrusterDirection.Forward == forward)
+                        {
+                            thruster.SetValue("Override", thrustValue / 10);
+                        }
+                        else if (direction == ThrustDirection.SlightlyBackward && thrusterDirection.Forward == backward)
+                        {
+                            thruster.SetValue("Override", thrustValue / 20);
+                        }
+                        else if (direction == ThrustDirection.HardBackward && thrusterDirection.Forward == backward)
+                        {
                             thruster.SetValue("Override", thrustValue);
+                        }
                         else if (thrusterDirection.Forward == up)
+                        {
                             thruster.SetValue("Override", droneUpwardOverrideThrust);
+                        }
                     }
                     else
                     {
@@ -799,7 +996,16 @@ namespace IngameScript
             {
                 List<IMyTextPanel> lcdpanels = new List<IMyTextPanel>();
                 GridTerminalSystem.GetBlocksOfType(lcdpanels, block => block.CubeGrid == Me.CubeGrid);
-                lcdPanel = lcdpanels.Count > 0 ? lcdpanels[0] : null;
+                foreach (var lcdPanel in lcdpanels)
+                {
+                    if (lcdPanel.CustomName.Contains("[Drone Control]"))
+                    {
+                        lcdPanel.WriteText("Script Ready\n", false);
+                        this.lcdPanel = lcdPanel;
+                        //Echo("LCD Panel found.");
+                        return;
+                    }
+                }
             }
         }
 
@@ -807,42 +1013,46 @@ namespace IngameScript
         {
             if (droneConnector.Status == MyShipConnectorStatus.Connected || droneConnector.Status == MyShipConnectorStatus.Connectable)
             {
-                carrier_connector = droneConnector.OtherConnector;
-                lcdPanel.WriteText($"Carrier Connector:\n{droneConnector.OtherConnector.CustomName}\n", true);
-                return carrier_connector;
+                carrierConnector = droneConnector.OtherConnector;
+                carrier_connector_entityId = carrierConnector.EntityId;
+                //lcdPanel?.WriteText($"Carrier Connector:\n{droneConnector.OtherConnector.CustomName}\n", true);
+                return carrierConnector;
             }
             else
             {
-                lcdPanel.WriteText($"Not connected to another connector", true);
+                //lcdPanel?.WriteText($"Not connected to another connector\n", true);
                 return null;
             }
         }
 
         void CheckIfDroneHasArrivedAtDockingWaypoint()
         {
-            if (myRemoteControl != null && spugProgrammableBlock != null && lcdPanel != null)
+            if (myRemoteControl != null && spugProgrammableBlock != null)
             {
                 //Runtime.UpdateFrequency = UpdateFrequency.Update1;
-                double distanceToWaypoint = (myRemoteControl.GetPosition() - dockWaypoint).Length();
-                //lcdPanel.WriteText($"Docking\nDock Waypoint:\n {distanceToWaypoint:F2}\n", false);
+                double distanceToWaypoint = (myRemoteControl.GetPosition() - currentDockingWaypoint).Length();
+                //lcdPanel?.WriteText($"Docking\nDock Waypoint:\n {distanceToWaypoint:F2}\n", false);
 
 
                 if (distanceToWaypoint < 5.0)
                 {
-                    lcdPanel.WriteText("Dock WP Reached\n", true);
+                    //lcdPanel?.WriteText("Dock WP Reached\n", true);
                     //Echo("Waypoint reached!");
-                    droneIsFlyingToDockingWaypoint = false;
+                    droneIsFlyingToRemoteControlDockingWaypoint = false;
                     myRemoteControl.ApplyAction("AutoPilot_Off");
-                    spugProgrammableBlock.TryRun(carrier_connector.CustomName);
-                    lcdPanel.WriteText($"SPUG Dock:\n{carrier_connector.CustomName}\n", true);
-                    //lcdPanel.WriteText($"GPS:{Me.CubeGrid.CustomName}:{dockWaypoint.X}:{dockWaypoint.Y}:{dockWaypoint.Z}:#FF75C9F1", false);
+                    spugProgrammableBlock.TryRun(iGCCarrierConnectorCustomName); // Returns the drone to the "hopefully" saved carrier connector
+                    //lcdPanel?.WriteText($"SPUG Dock:\n{carrier_connector.CustomName}\n", true);
+                    //lcdPanel?.WriteText($"GPS:{Me.CubeGrid.CustomName}:{dockWaypoint.X}:{dockWaypoint.Y}:{dockWaypoint.Z}:#FF75C9F1", false);
                     //Echo($"SPUG PB run with command: {Me.CubeGrid.CustomName}.");
                     //Runtime.UpdateFrequency = UpdateFrequency.None;
                 }
             }
             else
             {
-                Echo("No remote control or SPUG programmable block found on the executing grid.");
+                if (myRemoteControl == null)
+                    Echo("Cant Finish Dock - No remote control found.");
+                if (spugProgrammableBlock == null)
+                    Echo("Cant Finish Dock - No SPUG programmable block found.");
             }
         }
 
@@ -867,7 +1077,7 @@ namespace IngameScript
 
         void UpdateAntennaWithOffensiveBlockCondition()
         {
-            if (droneOffensiveBlock != null) 
+            if (droneOffensiveBlock != null)
             {
                 IMySearchEnemyComponent searchComponent = droneOffensiveBlock.SearchEnemyComponent;
                 if (searchComponent != null)
@@ -883,20 +1093,6 @@ namespace IngameScript
                     }
                 }
             }
-        }
-
-        bool IsDroneForwardOfCarrierCenter(Vector3D dockingPos, Vector3D shipCenterPos, Vector3D shipForwardDir)
-        {
-            shipForwardDir.Normalize();  // Modifies shipForwardDir in place
-
-            Vector3D dockingDir = dockingPos - shipCenterPos;
-            double dotProduct = Vector3D.Dot(dockingDir, shipForwardDir);
-            lcdPanel.WriteText($"Dot Product:\n {dotProduct:F2}\n", false);
-
-            if (dotProduct >= 5.0)
-                return true; // >= 0 means forward
-            else
-                return false;
         }
 
         bool IsCarrierGrid()
@@ -965,6 +1161,7 @@ namespace IngameScript
                 if (!string.IsNullOrEmpty(gridName))
                 {
                     RenameGrid(gridName);
+                    UpdateBlocksOnGrid(gridName);
                 }
             }
         }
@@ -996,12 +1193,160 @@ namespace IngameScript
             {
                 currentGrid.CustomName = newGridName;
                 Echo($"Grid renamed to {newGridName}");
-                
+
             }
             else
             {
-                lcdPanel.WriteText($"Unable to rename grid. Current grid is null.", true);
+                lcdPanel?.WriteText($"Unable to rename grid. Current grid is null.", true);
             }
+        }
+
+        void UpdateBlocksOnGrid(string updatedGridName)
+        {
+            List<IMyTerminalBlock> blocksOnGrid = new List<IMyTerminalBlock>();
+            GridTerminalSystem.GetBlocksOfType<IMyTerminalBlock>(blocksOnGrid, block => block.CubeGrid == Me.CubeGrid);
+
+            foreach (var block in blocksOnGrid)
+            {
+                RemoveDroneSuffix(block);
+                RemoveCarrierSuffix(block);
+                AddGridNameSuffix(block);
+            }
+        }
+
+        void RemoveDroneSuffix(IMyTerminalBlock block)
+        {
+            string pattern = " - Drone \\d+";
+            var regex = new System.Text.RegularExpressions.Regex(pattern);
+
+            // Find all matches of the pattern in the block's name
+            var matches = regex.Matches(block.CustomName);
+
+            // Iterate through matches and remove them
+            foreach (System.Text.RegularExpressions.Match match in matches)
+            {
+                block.CustomName = block.CustomName.Replace(match.Value, "");
+            }
+        }
+
+        void RemoveCarrierSuffix(IMyTerminalBlock block)
+        {
+            string pattern = " - Carrier";
+            var regex = new System.Text.RegularExpressions.Regex(pattern);
+
+            // Find all matches of the pattern in the block's name
+            var matches = regex.Matches(block.CustomName);
+
+            // Iterate through matches and remove them
+            foreach (System.Text.RegularExpressions.Match match in matches)
+            {
+                block.CustomName = block.CustomName.Replace(match.Value, "");
+            }
+        }
+
+        void AddGridNameSuffix(IMyTerminalBlock block)
+        {
+            string gridName = Me.CubeGrid.CustomName;
+            if (!IsCarrierGrid())
+                block.CustomName = $"{block.CustomName} - {gridName}";
+            else
+                block.CustomName = $"{block.CustomName} - Carrier";
+        }
+
+        enum ThrustDirection
+        {
+            HardForward,
+            SlightlyForward,
+            Up,
+            SlightlyBackward,
+            HardBackward,
+            None
+        }
+
+        // Method to parse MatrixD from the provided string
+        public MatrixD ParseMatrixFromString(string message)
+        {
+            // Split the message into components
+            string[] parts = message.Split(' ');
+
+            double m11 = ExtractNumericValue("M11:", parts);
+            double m12 = ExtractNumericValue("M12:", parts);
+            double m13 = ExtractNumericValue("M13:", parts);
+            double m14 = ExtractNumericValue("M14:", parts);
+            double m21 = ExtractNumericValue("M21:", parts);
+            double m22 = ExtractNumericValue("M22:", parts);
+            double m23 = ExtractNumericValue("M23:", parts);
+            double m24 = ExtractNumericValue("M24:", parts);
+            double m31 = ExtractNumericValue("M31:", parts);
+            double m32 = ExtractNumericValue("M32:", parts);
+            double m33 = ExtractNumericValue("M33:", parts);
+            double m34 = ExtractNumericValue("M34:", parts);
+            double m41 = ExtractNumericValue("M41:", parts);
+            double m42 = ExtractNumericValue("M42:", parts);
+            double m43 = ExtractNumericValue("M43:", parts);
+            double m44 = ExtractNumericValue("M44:", parts);
+
+            return new MatrixD(
+                m11, m12, m13, m14,
+                m21, m22, m23, m24,
+                m31, m32, m33, m34,
+                m41, m42, m43, m44
+            );
+        }
+
+        // Helper method to extract a numeric value
+        public double ExtractNumericValue(string key, string[] parts)
+        {
+            foreach (var part in parts)
+            {
+                if (part.Contains(key))
+                {
+                    var index = part.IndexOf(key);
+
+                    // Adjust substring based on the presence of '{'
+                    var keyValue = (part[index] == '{') ? part.Substring(index + 1).Trim() : part.Substring(index + key.Length).Trim();
+
+                    // Handle the case where keyValue starts with ':'
+                    if (keyValue.StartsWith(":"))
+                    {
+                        // Remove the leading colon and trim again
+                        keyValue = keyValue.Substring(1).Trim();
+                    }
+
+                    // Remove trailing '}'
+                    keyValue = keyValue.TrimEnd('}');
+
+                    //lcdPanel.WriteText($"Key: {key}\n", true);
+                    //lcdPanel.WriteText($"KeyValue: {keyValue}\n", true);
+
+                    double value;
+                    if (double.TryParse(keyValue, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out value))
+                    {
+                        return value;
+                    }
+                    break;
+                }
+            }
+            return 0.0;
+        }
+
+        public string ExtractConnectorCustomName(string input)
+        {
+            // Use a regular expression to match the pattern "Connector xx - Carrier"
+            System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(input, @"Connector (\d+) - Carrier");
+
+            // Check if the match was successful
+            if (match.Success)
+            {
+                // Extract the matched number
+                string connectorNumber = match.Groups[1].Value;
+
+                // Construct the desired format
+                return $"Connector {connectorNumber} - Carrier";
+            }
+
+            // Return a default value or throw an exception if needed
+            return "Connector - Carrier";
         }
     }
 }
